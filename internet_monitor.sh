@@ -17,9 +17,9 @@ PING_TIMEOUT=2                                   # Timeout pro ping (-W, sekundy
 PING_SUCCESS_THRESHOLD=1                         # Min. počet úspěšných cílů pro UP stav
 
 # Cesty a soubory
-LOG_FILE="/home/user_name/poruchy.csv"              # Cesta k CSV logu
-TEMP_STATE="/home/user_name/.inet_monitor.state"    # Dočasný soubor pro stav
-LOCK_FILE="/home/user_name/.inet_monitor.lock"      # Lock soubor proti duplicitním instancím
+LOG_FILE="$HOME/poruchy.csv"              # Cesta k CSV logu
+TEMP_STATE="$HOME/.inet_monitor.state"    # Dočasný soubor pro stav
+LOCK_FILE="$HOME/.inet_monitor.lock"      # Lock soubor proti duplicitním instancím
 
 # Cloud upload (rclone)
 RCLONE_REMOTE="protondrive"                      # Název rclone remote (gdrive, proton, apod.)
@@ -29,7 +29,7 @@ UPLOAD_INTERVAL=3600                             # Pravidelný upload (sekundy, 
 
 # E-mail notifikace (volitelné)
 SEND_EMAIL=false                                 # Zapnout/vypnout e-mail notifikace
-EMAIL_RECIPIENT="admin@email.com"                # E-mail příjemce
+EMAIL_RECIPIENT="admin@example.com"                # E-mail příjemce
 EMAIL_SUBJECT_PREFIX="[Internet Monitor]"        # Prefix předmětu e-mailu
 
 # Rozšířené možnosti
