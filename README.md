@@ -1,17 +1,19 @@
+
 # internet-monitor
+
 Robustní skript pro dlouhodobý **monitoring výpadků internetu** na Linuxu (testováno zejména na Void Linux s runit). Skript loguje všechny změny stavu připojení, ukládá výsledky do CSV a automaticky je zálohuje do cloudu přes [rclone](https://rclone.org/) (Proton Drive, Google Drive…). Ideální jako důkaz pro poskytovatele nebo ČTÚ.
 
 ---
 
 ## 🚀 Funkce
 
-- **Monitorování více cílů najednou (ping)**
-- **Rozpoznání různých chybových stavů (DNS fail, timeout, unreachable...)**
-- **Podrobný CSV log, připravený pro důkazní účely**
-- **Automatický upload logu do cloudu (Proton Drive/Google Drive...)**
-- **Automatická rotace logu**
-- **Běh jako runit služba**
-- (volitelně) Emailové notifikace při výpadku/obnovení
+* **Monitorování více cílů najednou (ping)**
+* **Rozpoznání různých chybových stavů (DNS fail, timeout, unreachable...)**
+* **Podrobný CSV log, připravený pro důkazní účely**
+* **Automatický upload logu do cloudu (Proton Drive/Google Drive...)**
+* **Automatická rotace logu**
+* **Běh jako runit služba**
+* (volitelně) Emailové notifikace při výpadku/obnovení
 
 ---
 
@@ -23,7 +25,7 @@ Robustní skript pro dlouhodobý **monitoring výpadků internetu** na Linuxu (t
 git clone https://github.com/yourusername/internet-monitor.git
 cd internet-monitor
 chmod +x internet_monitor.sh
-````
+```
 
 ### 2. Instalace závislostí
 
@@ -47,21 +49,28 @@ rclone lsd protondrive:
 
 ---
 
-## ⚙️ Konfigurace skriptu
+## ⚠️ Důležitá úprava před použitím!
 
-Otevři `internet_monitor.sh` a uprav základní proměnné:
+> **Po stažení skriptu z GitHubu je nutné upravit některé proměnné v souboru `internet_monitor.sh`, aby skript správně fungoval v tvém prostředí. Pokud toto neupravíš, nebude logování nebo zálohování fungovat správně!**
+
+**V souboru `internet_monitor.sh` nastav zejména:**
 
 ```bash
-PING_TARGETS=("8.8.8.8" "1.1.1.1" "8.8.4.4")
-LOG_FILE="/home/yourusername/poruchy.csv"
-RCLONE_REMOTE="protondrive"
-RCLONE_PATH="monitoring/"
-SEND_EMAIL=false
-UPLOAD_ON_CHANGE=true
-UPLOAD_INTERVAL=3600
+# Cesty k logům a stavovým souborům:
+LOG_FILE="$HOME/inet_monitor_log.csv"      # Doporučeno: použij např. /home/tvůj_user/inet_monitor_log.csv
+TEMP_STATE="$HOME/.inet_monitor.state"
+LOCK_FILE="$HOME/.inet_monitor.lock"
+
+# Nastavení cloudu (dle tvého rclone configu):
+RCLONE_REMOTE="protondrive"                # Název remotu podle rclone config (např. 'protondrive', 'gdrive', ...)
+RCLONE_PATH="monitoring/"                  # Složka v cloudu
+
+# Email (jen pokud chceš emaily):
+SEND_EMAIL=false                           # true/false – pokud chceš e-mail notifikace
+EMAIL_RECIPIENT="admin@example.com"        # Tvoje adresa (pokud používáš e-mail notifikace)
 ```
 
-*(nahraď `yourusername` svým uživatelským jménem)*
+**Uprav také případné cesty v runit službě a logování – viz další sekce!**
 
 ---
 
@@ -80,6 +89,8 @@ nohup ./internet_monitor.sh > /dev/null 2>&1 &
 ```
 
 ### Automaticky jako služba (runit)
+
+> **Při nastavování služby nezapomeň upravit uživatele a cesty v run skriptu podle svého prostředí!**
 
 **Vytvoření runit služby:**
 
@@ -122,7 +133,7 @@ sudo ln -s /etc/sv/internet-monitor /var/service/
   `sudo tail -f /var/log/internet-monitor/current`
 
 * **CSV log:**
-  `tail -f /home/yourusername/poruchy.csv`
+  `tail -f /cesta/k/inet_monitor_log.csv` *(dle tvého LOG\_FILE!)*
 
 * **Cloud upload:**
   `rclone ls protondrive:monitoring/`
@@ -140,7 +151,7 @@ sudo ln -s /etc/sv/internet-monitor /var/service/
 2025-08-01 12:46:12 - Connection restored (4ms avg) - outage duration: 00:01:02 (3/3)
 ```
 
-### CSV log (`poruchy.csv`)
+### CSV log (`inet_monitor_log.csv`)
 
 ```
 timestamp,status,latency_ms,outage_duration,target_tested,error_details,script_version
@@ -195,3 +206,8 @@ Napiš issue nebo pull request – projekt je otevřený pro další nápady a v
 ---
 
 **Happy monitoring! Ať máš konečně důkaz místo dohadů.**
+
+---
+
+> **Shrnutí:**
+> Po stažení zkontroluj a uprav ve skriptu cesty (LOG\_FILE, TEMP\_STATE, LOCK\_FILE), cloud remote a email, podle svého systému a účtu.
