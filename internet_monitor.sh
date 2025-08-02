@@ -8,11 +8,11 @@
 # Zaznamenává výpadky do CSV pro stížnosti na ČTÚ/ISP
 #################################################################
 
-set -euo pipefail
+set -euo pipefail  # Bezpečné nastavení Bash: fail na chybu/nezadanou proměnnou
 
 # ===== KONFIGURACE =====
 
-# Ping cíle podle traceroute k ISP (pevně dané)
+# Staticky nastavené IP adresy pro ping (edituj podle své trasy, každý je 1 hop)
 readonly PING_TARGETS=(
     "192.168.1.1"      # Domácí router
     "10.4.40.1"        # První hop ISP (anténa/AP)
@@ -21,39 +21,41 @@ readonly PING_TARGETS=(
     "88.86.97.137"     # StarNet customer router
 )
 
-# Parametry testování
-readonly PING_INTERVAL=30
-readonly PING_COUNT=2
-readonly PING_TIMEOUT=2
-readonly SUCCESS_THRESHOLD=${#PING_TARGETS[@]}  # Všechny musí odpovídat
+# Intervaly a parametry testů
+readonly PING_INTERVAL=30      # Jak často testovat (sekundy)
+readonly PING_COUNT=2          # Kolik pingů na cíl
+readonly PING_TIMEOUT=2        # Timeout pro 1 ping (s)
+readonly SUCCESS_THRESHOLD=${#PING_TARGETS[@]}  # Kolik cílů musí odpovědět (všechny)
 
-# Soubory a cesty
-readonly SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-readonly LOG_FILE="$HOME/poruchy.csv"
-readonly STATE_FILE="$HOME/.inet_monitor_state"
-readonly LOCK_FILE="$HOME/.inet_monitor.lock"
+# Cesty k souborům – EDITUJ dle potřeby!
+readonly SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"  # Cesta k aktuálnímu skriptu
+readonly LOG_FILE="$HOME/poruchy.csv"        # CSV log s výsledky
+readonly STATE_FILE="$HOME/.inet_monitor_state"   # Soubor pro ukládání posledního stavu (UP/DOWN + čas)
+readonly LOCK_FILE="$HOME/.inet_monitor.lock"     # Zámek proti více instancím
 
-# Cloud backup
-readonly RCLONE_REMOTE="protondrive"
-readonly RCLONE_PATH="monitoring/"
-readonly UPLOAD_INTERVAL=3600
+# Cloud backup (rclone)
+readonly RCLONE_REMOTE="protondrive"    # Název vzdáleného úložiště v rclone
+readonly RCLONE_PATH="monitoring/"      # Cílová složka na cloudu
+readonly UPLOAD_INTERVAL=3600           # Minimální interval mezi uploady (s)
 
 # Ostatní nastavení
-readonly MAX_LOG_SIZE=10485760  # 10MB
-readonly VERBOSE=true
+readonly MAX_LOG_SIZE=10485760  # 10 MB (rotace logu)
+readonly VERBOSE=true           # Detailní výstup (nastav na false pro ticho)
 
 # ===== GLOBÁLNÍ PROMĚNNÉ =====
 
-declare -g SHUTDOWN_REQUESTED=false
-declare -g LAST_UPLOAD_TIME=0
+declare -g SHUTDOWN_REQUESTED=false      # Indikace požadavku na ukončení (přerušení/kill)
+declare -g LAST_UPLOAD_TIME=0            # Čas posledního uploadu do cloudu
 
 # ===== UTILITY FUNKCE =====
 
+# Logování zpráv s úrovní (INFO/WARN/ERROR/DEBUG) na výstup i (případně) do syslogu
 log_message() {
     local level="$1"
     local message="$2"
     local timestamp=$(date '+%Y-%m-%d %H:%M:%S')
     
+    # Výpis na stdout/stderr podle úrovně
     case "$level" in
         ERROR) echo "[$timestamp] ERROR: $message" >&2 ;;
         WARN)  echo "[$timestamp] WARN:  $message" >&2 ;;
@@ -61,16 +63,16 @@ log_message() {
         DEBUG) [[ "$VERBOSE" == "true" ]] && echo "[$timestamp] DEBUG: $message" ;;
     esac
     
-    # Syslog pokud je dostupný
+    # Zápis do syslogu (logger), pokud je zapnutý verbose a logger je dostupný
     if [[ "$VERBOSE" == "true" ]] && command -v logger >/dev/null 2>&1; then
         logger -t "inet_monitor" "$level: $message"
     fi
 }
 
+# Ukončení se zprávou a úklidem (log, release lock)
 error_exit() {
     local exit_code="$1"
     local message="$2"
-    
     log_message ERROR "$message"
     cleanup_and_exit
     exit "$exit_code"
@@ -78,6 +80,7 @@ error_exit() {
 
 # ===== LOCK FILE MANAGEMENT =====
 
+# Získání locku (aby neběžely dvě instance)
 acquire_lock() {
     if [[ -f "$LOCK_FILE" ]]; then
         local existing_pid
@@ -86,15 +89,15 @@ acquire_lock() {
         if kill -0 "$existing_pid" 2>/dev/null; then
             error_exit 1 "Již běží jiná instance (PID: $existing_pid)"
         else
-            log_message WARN "Odstraňujem starý lock file"
+            log_message WARN "Odstraňuji starý lock file (proces už nežije)"
             rm -f "$LOCK_FILE"
         fi
     fi
-    
     echo $$ > "$LOCK_FILE"
     log_message DEBUG "Lock získán"
 }
 
+# Uvolnění locku na konci
 release_lock() {
     [[ -f "$LOCK_FILE" ]] && rm -f "$LOCK_FILE"
     log_message DEBUG "Lock uvolněn"
@@ -102,31 +105,33 @@ release_lock() {
 
 # ===== INICIALIZACE =====
 
+# Inicializace prostředí – složky, soubory, trap signálů
 initialize() {
     log_message INFO "Inicializace monitoring skriptu"
     
-    # Vytvoření adresářů
+    # Vytvoření adresářů podle potřeby
     mkdir -p "$(dirname "$LOG_FILE")" "$(dirname "$STATE_FILE")"
     
-    # Vytvoření CSV hlavičky pokud neexistuje
+    # Pokud není log, založ nový se záhlavím
     if [[ ! -f "$LOG_FILE" ]]; then
         echo "timestamp,status,latency_ms,outage_duration,failed_targets,error_details" > "$LOG_FILE"
         log_message INFO "Vytvořen CSV log: $LOG_FILE"
     fi
     
-    # Inicializace stavu
+    # Pokud není state file, vytvoř nový (výchozí stav UP)
     if [[ ! -f "$STATE_FILE" ]]; then
         echo "UP" > "$STATE_FILE"
         echo "$(date '+%Y-%m-%d %H:%M:%S')" >> "$STATE_FILE"
         log_message INFO "Inicializován stavový soubor"
     fi
     
-    # Nastavení trap pro graceful shutdown  
+    # Trap na ukončení (SIGINT/SIGTERM) – nastaví SHUTDOWN_REQUESTED=true
     trap 'SHUTDOWN_REQUESTED=true; log_message INFO "Shutdown požadován"' SIGINT SIGTERM
 }
 
 # ===== PING TESTY =====
 
+# Otestuje jeden konkrétní cíl (IP) – vrací string ve formátu "SUCCESS:latence" nebo "FAIL:typ_chyby"
 test_single_target() {
     local target="$1"
     local output exit_code latency
@@ -135,12 +140,12 @@ test_single_target() {
     exit_code=$?
     
     if [[ $exit_code -eq 0 ]]; then
-        # Extrakce latence
+        # Najde největší "time=xxx" v řetězci, extrahuje ms (případně celé číslo)
         latency=$(echo "$output" | grep -oE "time=[0-9]+(\.[0-9]+)?" | tail -1 | cut -d'=' -f2)
-        latency=${latency%.*}  # Pouze celá čísla
+        latency=${latency%.*}  # Odstraň desetinnou část
         echo "SUCCESS:${latency:-0}"
     else
-        # Určení typu chyby
+        # Typizace selhání podle hlášek ping
         if echo "$output" | grep -q "Name or service not known"; then
             echo "FAIL:DNS_ERROR"
         elif echo "$output" | grep -q "Network is unreachable"; then
@@ -153,6 +158,8 @@ test_single_target() {
     fi
 }
 
+# Otestuje všechny cíle v PING_TARGETS, spočítá počet úspěšných, celkovou latenci, sebere errory
+# Výsledek: pro UP "UP:latence::n/m", pro DOWN "DOWN:0:selhane_cile:detaily"
 ping_test_all_targets() {
     local successful_targets=0
     local total_latency=0
@@ -179,7 +186,7 @@ ping_test_all_targets() {
         fi
     done
     
-    # Odstranění koncových čárek
+    # Odstraní případnou koncovou čárku (pro CSV)
     failed_targets="${failed_targets%,}"
     error_details="${error_details%,}"
     
@@ -193,6 +200,7 @@ ping_test_all_targets() {
 
 # ===== STAV A LOGOVÁNÍ =====
 
+# Načte předchozí stav z $STATE_FILE (status:čas)
 read_previous_state() {
     if [[ -f "$STATE_FILE" ]]; then
         local previous_status previous_time
@@ -209,6 +217,7 @@ read_previous_state() {
     fi
 }
 
+# Aktualizuje stavový soubor (status, čas)
 update_state() {
     local status="$1"
     local timestamp="$2"
@@ -220,6 +229,7 @@ update_state() {
     } > "$STATE_FILE"
 }
 
+# Spočítá délku výpadku (od-do), vrací formát hh:mm:ss
 calculate_outage_duration() {
     local start_time="$1"
     local end_time="$2"
@@ -251,6 +261,7 @@ calculate_outage_duration() {
     printf "%02d:%02d:%02d" "$hours" "$minutes" "$seconds"
 }
 
+# Zápis výsledku do CSV logu (úprava pro oddělení čárek ve stringu)
 log_to_csv() {
     local timestamp="$1"
     local status="$2"
@@ -259,7 +270,7 @@ log_to_csv() {
     local failed_targets="$5"
     local error_details="$6"
     
-    # Escape CSV fields (nahrazení čárek středníky)
+    # Nahrazení čárek středníky (CSV friendly)
     failed_targets="${failed_targets//,/;}"
     error_details="${error_details//,/;}"
     
@@ -268,21 +279,18 @@ log_to_csv() {
 
 # ===== CLOUD BACKUP =====
 
+# Upload CSV do cloudu přes rclone, pokud je dostupný a nakonfigurovaný remote
 upload_to_cloud() {
     [[ ! -f "$LOG_FILE" ]] && return 1
-    
     if ! command -v rclone >/dev/null 2>&1; then
         log_message WARN "rclone není nainstalován, přeskakuji upload"
         return 1
     fi
-    
     if ! rclone listremotes | grep -q "^${RCLONE_REMOTE}:$"; then
         log_message WARN "rclone remote '$RCLONE_REMOTE' není nakonfigurován"
         return 1
     fi
-    
     log_message DEBUG "Uploading do cloudu..."
-    
     if rclone copy "$LOG_FILE" "$RCLONE_REMOTE:$RCLONE_PATH" --quiet; then
         LAST_UPLOAD_TIME=$(date +%s)
         log_message INFO "Upload do cloudu úspěšný"
@@ -293,44 +301,42 @@ upload_to_cloud() {
     fi
 }
 
+# Vrací true/false: je čas na pravidelný upload do cloudu?
 should_upload() {
     local current_time
     current_time=$(date +%s)
     local time_since_upload=$((current_time - LAST_UPLOAD_TIME))
-    
     [[ $time_since_upload -ge $UPLOAD_INTERVAL ]]
 }
 
 # ===== LOG ROTACE =====
 
+# Kontrola velikosti logu, pokud přesáhne limit, provede rotaci a založí nový log
 check_log_rotation() {
     [[ ! -f "$LOG_FILE" ]] && return
     
+    # Kompatibilita BSD vs GNU stat (BSD má -f%z, GNU -c%s)
     local log_size
     log_size=$(stat -f%z "$LOG_FILE" 2>/dev/null || stat -c%s "$LOG_FILE" 2>/dev/null || echo 0)
     
     if [[ $log_size -gt $MAX_LOG_SIZE ]]; then
         local backup_file="${LOG_FILE%.csv}-$(date '+%Y%m%d_%H%M%S').csv"
-        
         mv "$LOG_FILE" "$backup_file"
         echo "timestamp,status,latency_ms,outage_duration,failed_targets,error_details" > "$LOG_FILE"
-        
         log_message INFO "Log rotován: $backup_file (velikost: $((log_size/1024))KB)"
-        
-        # Async upload rotovaného souboru
+        # Asynchronní upload rotovaného souboru (neblokuje běh)
         (rclone copy "$backup_file" "$RCLONE_REMOTE:$RCLONE_PATH" --quiet &) 2>/dev/null
     fi
 }
 
 # ===== CLEANUP =====
 
+# Úklid při ukončení (release lock, kill background joby)
 cleanup_and_exit() {
     log_message INFO "Ukončuji monitoring..."
     release_lock
-    
-    # Ukončení background procesů
+    # Kill background joby (např. async upload)
     jobs -p | xargs -r kill 2>/dev/null || true
-    
     exit 0
 }
 
@@ -343,25 +349,25 @@ main_loop() {
     log_message INFO "Úspěch: $SUCCESS_THRESHOLD/${#PING_TARGETS[@]} cílů"
     
     while [[ "$SHUTDOWN_REQUESTED" == "false" ]]; do
-        # Kontrola rotace logu
-        check_log_rotation
+        check_log_rotation    # Každý cyklus kontrola velikosti logu
         
-        # Provedení ping testů
+        # Čas testu
         local current_time
         current_time=$(date '+%Y-%m-%d %H:%M:%S')
         
+        # Proveď ping testy všech cílů
         local test_result
         test_result=$(ping_test_all_targets)
         
-        # Parsování výsledku
+        # Rozparsování výsledku na proměnné
         IFS=':' read -r current_status latency failed_targets error_details <<< "$test_result"
         
-        # Čtení předchozího stavu
+        # Zjisti předchozí stav (UP/DOWN a čas)
         local previous_state
         previous_state=$(read_previous_state)
         IFS=':' read -r previous_status previous_time <<< "$previous_state"
         
-        # Detekce změny stavu
+        # Pokud nastala změna stavu, loguj a update
         if [[ "$current_status" != "$previous_status" ]]; then
             log_message INFO "Změna stavu: $previous_status -> $current_status"
             
@@ -374,21 +380,17 @@ main_loop() {
                     if [[ "$previous_status" == "DOWN" ]]; then
                         local outage_duration
                         outage_duration=$(calculate_outage_duration "$previous_time" "$current_time")
-                        
                         log_to_csv "$current_time" "UP" "$latency" "$outage_duration" "" ""
                         log_message INFO "Připojení obnoveno (${latency}ms) - výpadek: $outage_duration"
                     fi
                     ;;
             esac
             
-            # Aktualizace stavu
             update_state "$current_status" "$current_time"
-            
-            # Okamžitý upload při změně stavu
-            upload_to_cloud &
+            upload_to_cloud &   # Okamžitý upload do cloudu na změnu stavu (async)
         fi
         
-        # Pravidelný upload
+        # Pravidelný (časovaný) upload, i bez změny stavu
         if should_upload; then
             upload_to_cloud &
         fi
@@ -401,38 +403,14 @@ main_loop() {
 # ===== MAIN =====
 
 main() {
-    # Kontrola argumentů
-    while [[ $# -gt 0 ]]; do
-        case $1 in
-            -v|--verbose)
-                VERBOSE=true
-                ;;
-            -h|--help)
-                echo "Použití: $0 [-v|--verbose] [-h|--help]"
-                echo "  -v, --verbose    Podrobný výstup"
-                echo "  -h, --help       Tato nápověda"
-                exit 0
-                ;;
-            *)
-                echo "Neznámý parametr: $1" >&2
-                exit 1
-                ;;
-        esac
-        shift
-    done
-    
-    # Inicializace
+    # Nepodporuje uživatelské parametry (vše natvrdo, jednoduše)
     acquire_lock
     initialize
-    
-    # Spuštění hlavní smyčky
     main_loop
-    
-    # Cleanup
     cleanup_and_exit
 }
 
-# Spuštění pouze pokud je skript spuštěn přímo
+# Spouštění pouze pokud je skript spuštěn přímo (ne jako import)
 if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
     main "$@"
 fi
