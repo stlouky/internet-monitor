@@ -1,354 +1,438 @@
 #!/bin/bash
 
 #################################################################
-# Internet Connection Monitor for Void Linux (runit/tmux/screen)
-# Sleduje připojení k internetu a loguje všechny výpadky
-# Pro dlouhodobou evidenci při stížnostech na ISP/ČTÚ
-# Verze: 2.0 (Enhanced) - Robustní monitoring s více cíli
+# Internet Connection Monitor - Refactored v2.1
+# 
+# Účel: Monitoring připojení k ISP pro evidence výpadků
+# Testuje cestu k ISP podle traceroute výstupu
+# Zaznamenává výpadky do CSV pro stížnosti na ČTÚ/ISP
 #################################################################
 
-# ===== KONFIGURACE - UPRAVTE PODLE POTŘEBY =====
+set -euo pipefail
 
-# Ping parametry - více cílů pro zvýšenou spolehlivost
-PING_TARGETS=("8.8.8.8" "1.1.1.1" "8.8.4.4")     # Google DNS, Cloudflare, Google DNS2
-PING_INTERVAL=30                                 # Interval mezi pingy (sekundy)
-PING_COUNT=2                                     # Počet ping paketů (-c)
-PING_TIMEOUT=2                                   # Timeout pro ping (-W, sekundy)
-PING_SUCCESS_THRESHOLD=1                         # Min. počet úspěšných cílů pro UP stav
+# ===== KONFIGURACE =====
 
-# Cesty a soubory
-LOG_FILE="$HOME/poruchy.csv"              # Cesta k CSV logu
-TEMP_STATE="$HOME/.inet_monitor.state"    # Dočasný soubor pro stav
-LOCK_FILE="$HOME/.inet_monitor.lock"      # Lock soubor proti duplicitním instancím
+# Ping cíle podle traceroute k ISP (pevně dané)
+readonly PING_TARGETS=(
+    "192.168.1.1"      # Domácí router
+    "10.4.40.1"        # První hop ISP (anténa/AP)
+    "100.100.4.254"    # Druhý hop StarNet
+    "172.31.255.2"     # Třetí hop (backbone)
+    "88.86.97.137"     # StarNet customer router
+)
 
-# Cloud upload (rclone)
-RCLONE_REMOTE="protondrive"                      # Název rclone remote (gdrive, proton, apod.)
-RCLONE_PATH="monitoring/"                        # Cesta v cloudu
-UPLOAD_ON_CHANGE=true                            # Upload při každé změně stavu
-UPLOAD_INTERVAL=3600                             # Pravidelný upload (sekundy, 0=vypnuto)
+# Parametry testování
+readonly PING_INTERVAL=30
+readonly PING_COUNT=2
+readonly PING_TIMEOUT=2
+readonly SUCCESS_THRESHOLD=${#PING_TARGETS[@]}  # Všechny musí odpovídat
 
-# E-mail notifikace (volitelné)
-SEND_EMAIL=false                                 # Zapnout/vypnout e-mail notifikace
-EMAIL_RECIPIENT="admin@example.com"                # E-mail příjemce
-EMAIL_SUBJECT_PREFIX="[Internet Monitor]"        # Prefix předmětu e-mailu
+# Soubory a cesty
+readonly SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+readonly LOG_FILE="$HOME/poruchy.csv"
+readonly STATE_FILE="$HOME/.inet_monitor_state"
+readonly LOCK_FILE="$HOME/.inet_monitor.lock"
 
-# Rozšířené možnosti
-MAX_LOG_SIZE=10485760                            # Max. velikost logu (10MB)
-VERBOSE_LOGGING=true                             # Podrobné logování do systému
-HEALTH_CHECK_INTERVAL=300                        # Zdravotní kontrola skriptu (5min)
+# Cloud backup
+readonly RCLONE_REMOTE="protondrive"
+readonly RCLONE_PATH="monitoring/"
+readonly UPLOAD_INTERVAL=3600
 
-# ===== INICIALIZACE A KONTROLA PROSTŘEDÍ =====
+# Ostatní nastavení
+readonly MAX_LOG_SIZE=10485760  # 10MB
+readonly VERBOSE=true
 
-# Kontrola duplicitní instance
-if [[ -f "$LOCK_FILE" ]]; then
-    if kill -0 "$(cat "$LOCK_FILE")" 2>/dev/null; then
-        echo "ERROR: Another instance is already running (PID: $(cat "$LOCK_FILE"))"
-        exit 1
-    else
-        rm -f "$LOCK_FILE"
-    fi
-fi
-echo $$ > "$LOCK_FILE"
+# ===== GLOBÁLNÍ PROMĚNNÉ =====
 
-# Vytvoření adresářů pokud neexistují
-mkdir -p "$(dirname "$LOG_FILE")" "$(dirname "$TEMP_STATE")"
+declare -g SHUTDOWN_REQUESTED=false
+declare -g LAST_UPLOAD_TIME=0
 
-# Vytvoření CSV souboru s rozšířenou hlavičkou
-if [[ ! -f "$LOG_FILE" ]]; then
-    echo "timestamp,status,latency_ms,outage_duration,target_tested,error_details,script_version" > "$LOG_FILE"
-    echo "$(date '+%Y-%m-%d %H:%M:%S') - Created enhanced log file: $LOG_FILE"
-fi
+# ===== UTILITY FUNKCE =====
 
-# Inicializace stavového souboru
-if [[ ! -f "$TEMP_STATE" ]]; then
-    echo "UP" > "$TEMP_STATE"
-    echo "$(date '+%Y-%m-%d %H:%M:%S')" >> "$TEMP_STATE"
-    echo "Script started" >> "$TEMP_STATE"
-fi
-
-# ===== FUNKCE =====
-
-# Funkce pro logování zpráv (rozšířená)
 log_message() {
-    local message="$1"
+    local level="$1"
+    local message="$2"
     local timestamp=$(date '+%Y-%m-%d %H:%M:%S')
-    echo "$timestamp - $message"
     
-    # Zápis do syslogu pokud je dostupný
-    if [[ "$VERBOSE_LOGGING" == "true" ]] && command -v logger >/dev/null 2>&1; then
-        logger -t "inet_monitor" "$message"
+    case "$level" in
+        ERROR) echo "[$timestamp] ERROR: $message" >&2 ;;
+        WARN)  echo "[$timestamp] WARN:  $message" >&2 ;;
+        INFO)  echo "[$timestamp] INFO:  $message" ;;
+        DEBUG) [[ "$VERBOSE" == "true" ]] && echo "[$timestamp] DEBUG: $message" ;;
+    esac
+    
+    # Syslog pokud je dostupný
+    if [[ "$VERBOSE" == "true" ]] && command -v logger >/dev/null 2>&1; then
+        logger -t "inet_monitor" "$level: $message"
     fi
 }
 
-# Funkce pro výpočet délky výpadku (vylepšená)
+error_exit() {
+    local exit_code="$1"
+    local message="$2"
+    
+    log_message ERROR "$message"
+    cleanup_and_exit
+    exit "$exit_code"
+}
+
+# ===== LOCK FILE MANAGEMENT =====
+
+acquire_lock() {
+    if [[ -f "$LOCK_FILE" ]]; then
+        local existing_pid
+        existing_pid=$(cat "$LOCK_FILE")
+        
+        if kill -0 "$existing_pid" 2>/dev/null; then
+            error_exit 1 "Již běží jiná instance (PID: $existing_pid)"
+        else
+            log_message WARN "Odstraňujem starý lock file"
+            rm -f "$LOCK_FILE"
+        fi
+    fi
+    
+    echo $$ > "$LOCK_FILE"
+    log_message DEBUG "Lock získán"
+}
+
+release_lock() {
+    [[ -f "$LOCK_FILE" ]] && rm -f "$LOCK_FILE"
+    log_message DEBUG "Lock uvolněn"
+}
+
+# ===== INICIALIZACE =====
+
+initialize() {
+    log_message INFO "Inicializace monitoring skriptu"
+    
+    # Vytvoření adresářů
+    mkdir -p "$(dirname "$LOG_FILE")" "$(dirname "$STATE_FILE")"
+    
+    # Vytvoření CSV hlavičky pokud neexistuje
+    if [[ ! -f "$LOG_FILE" ]]; then
+        echo "timestamp,status,latency_ms,outage_duration,failed_targets,error_details" > "$LOG_FILE"
+        log_message INFO "Vytvořen CSV log: $LOG_FILE"
+    fi
+    
+    # Inicializace stavu
+    if [[ ! -f "$STATE_FILE" ]]; then
+        echo "UP" > "$STATE_FILE"
+        echo "$(date '+%Y-%m-%d %H:%M:%S')" >> "$STATE_FILE"
+        log_message INFO "Inicializován stavový soubor"
+    fi
+    
+    # Nastavení trap pro graceful shutdown  
+    trap 'SHUTDOWN_REQUESTED=true; log_message INFO "Shutdown požadován"' SIGINT SIGTERM
+}
+
+# ===== PING TESTY =====
+
+test_single_target() {
+    local target="$1"
+    local output exit_code latency
+    
+    output=$(ping -c "$PING_COUNT" -W "$PING_TIMEOUT" "$target" 2>&1)
+    exit_code=$?
+    
+    if [[ $exit_code -eq 0 ]]; then
+        # Extrakce latence
+        latency=$(echo "$output" | grep -oE "time=[0-9]+(\.[0-9]+)?" | tail -1 | cut -d'=' -f2)
+        latency=${latency%.*}  # Pouze celá čísla
+        echo "SUCCESS:${latency:-0}"
+    else
+        # Určení typu chyby
+        if echo "$output" | grep -q "Name or service not known"; then
+            echo "FAIL:DNS_ERROR"
+        elif echo "$output" | grep -q "Network is unreachable"; then
+            echo "FAIL:NETWORK_UNREACHABLE"
+        elif echo "$output" | grep -q "Destination Host Unreachable"; then
+            echo "FAIL:HOST_UNREACHABLE"
+        else
+            echo "FAIL:TIMEOUT"
+        fi
+    fi
+}
+
+ping_test_all_targets() {
+    local successful_targets=0
+    local total_latency=0
+    local failed_targets=""
+    local error_details=""
+    
+    log_message DEBUG "Testování ${#PING_TARGETS[@]} cílů"
+    
+    for target in "${PING_TARGETS[@]}"; do
+        local result
+        result=$(test_single_target "$target")
+        
+        local status="${result%%:*}"
+        local value="${result##*:}"
+        
+        if [[ "$status" == "SUCCESS" ]]; then
+            ((successful_targets++))
+            ((total_latency += value))
+            log_message DEBUG "$target: OK (${value}ms)"
+        else
+            failed_targets="${failed_targets}$target,"
+            error_details="${error_details}$target:$value,"
+            log_message DEBUG "$target: FAIL ($value)"
+        fi
+    done
+    
+    # Odstranění koncových čárek
+    failed_targets="${failed_targets%,}"
+    error_details="${error_details%,}"
+    
+    if [[ $successful_targets -ge $SUCCESS_THRESHOLD ]]; then
+        local avg_latency=$((total_latency / successful_targets))
+        echo "UP:$avg_latency::$successful_targets/${#PING_TARGETS[@]}"
+    else
+        echo "DOWN:0:$failed_targets:$error_details"
+    fi
+}
+
+# ===== STAV A LOGOVÁNÍ =====
+
+read_previous_state() {
+    if [[ -f "$STATE_FILE" ]]; then
+        local previous_status previous_time
+        {
+            read -r previous_status
+            read -r previous_time
+        } < "$STATE_FILE" 2>/dev/null || {
+            echo "UNKNOWN:$(date '+%Y-%m-%d %H:%M:%S')"
+            return
+        }
+        echo "$previous_status:$previous_time"
+    else
+        echo "UNKNOWN:$(date '+%Y-%m-%d %H:%M:%S')"
+    fi
+}
+
+update_state() {
+    local status="$1"
+    local timestamp="$2"
+    
+    {
+        echo "$status"
+        echo "$timestamp"  
+        echo "Updated by PID $$ at $(date)"
+    } > "$STATE_FILE"
+}
+
 calculate_outage_duration() {
     local start_time="$1"
     local end_time="$2"
     
-    local start_epoch=$(date -d "$start_time" +%s 2>/dev/null)
-    local end_epoch=$(date -d "$end_time" +%s 2>/dev/null)
+    local start_epoch end_epoch duration
     
-    if [[ -z "$start_epoch" || -z "$end_epoch" || $start_epoch -gt $end_epoch ]]; then
+    start_epoch=$(date -d "$start_time" +%s 2>/dev/null) || {
         echo "N/A"
-        return
+        return 1
+    }
+    
+    end_epoch=$(date -d "$end_time" +%s 2>/dev/null) || {
+        echo "N/A" 
+        return 1
+    }
+    
+    if [[ $start_epoch -gt $end_epoch ]]; then
+        echo "N/A"
+        return 1
     fi
     
-    local duration=$((end_epoch - start_epoch))
-    local days=$((duration / 86400))
-    local hours=$(((duration % 86400) / 3600))
-    local minutes=$(((duration % 3600) / 60))
-    local seconds=$((duration % 60))
+    duration=$((end_epoch - start_epoch))
     
-    if [[ $days -gt 0 ]]; then
-        printf "%dd %02d:%02d:%02d" "$days" "$hours" "$minutes" "$seconds"
-    else
-        printf "%02d:%02d:%02d" "$hours" "$minutes" "$seconds"
-    fi
+    local hours minutes seconds
+    hours=$((duration / 3600))
+    minutes=$(((duration % 3600) / 60))
+    seconds=$((duration % 60))
+    
+    printf "%02d:%02d:%02d" "$hours" "$minutes" "$seconds"
 }
 
-# Funkce pro odesílání e-mailových notifikací
-send_email_notification() {
-    local subject="$1"
-    local body="$2"
+log_to_csv() {
+    local timestamp="$1"
+    local status="$2"
+    local latency="$3"
+    local duration="$4"
+    local failed_targets="$5"
+    local error_details="$6"
     
-    if [[ "$SEND_EMAIL" != "true" ]]; then
-        return
-    fi
+    # Escape CSV fields (nahrazení čárek středníky)
+    failed_targets="${failed_targets//,/;}"
+    error_details="${error_details//,/;}"
     
-    if command -v mail >/dev/null 2>&1; then
-        echo -e "$body" | mail -s "$EMAIL_SUBJECT_PREFIX $subject" "$EMAIL_RECIPIENT" 2>/dev/null
-        if [[ $? -eq 0 ]]; then
-            log_message "Email notification sent successfully"
-        else
-            log_message "WARNING: Failed to send email notification"
-        fi
-    elif command -v sendmail >/dev/null 2>&1; then
-        {
-            echo "To: $EMAIL_RECIPIENT"
-            echo "Subject: $EMAIL_SUBJECT_PREFIX $subject"
-            echo ""
-            echo -e "$body"
-        } | sendmail "$EMAIL_RECIPIENT" 2>/dev/null
-        log_message "Email notification sent via sendmail"
-    else
-        log_message "WARNING: No mail command found, email notification skipped"
-    fi
+    echo "$timestamp,$status,$latency,$duration,$failed_targets,$error_details" >> "$LOG_FILE"
 }
 
-# Funkce pro upload do cloudu (vylepšená)
+# ===== CLOUD BACKUP =====
+
 upload_to_cloud() {
+    [[ ! -f "$LOG_FILE" ]] && return 1
+    
     if ! command -v rclone >/dev/null 2>&1; then
-        log_message "WARNING: rclone not found, skipping cloud upload"
+        log_message WARN "rclone není nainstalován, přeskakuji upload"
         return 1
     fi
     
-    # Kontrola konfigurace rclone
     if ! rclone listremotes | grep -q "^${RCLONE_REMOTE}:$"; then
-        log_message "WARNING: rclone remote '$RCLONE_REMOTE' not configured"
+        log_message WARN "rclone remote '$RCLONE_REMOTE' není nakonfigurován"
         return 1
     fi
     
-    local upload_start=$(date +%s)
+    log_message DEBUG "Uploading do cloudu..."
+    
     if rclone copy "$LOG_FILE" "$RCLONE_REMOTE:$RCLONE_PATH" --quiet; then
-        local upload_time=$(($(date +%s) - upload_start))
-        log_message "Successfully uploaded log to cloud ($RCLONE_REMOTE) in ${upload_time}s"
+        LAST_UPLOAD_TIME=$(date +%s)
+        log_message INFO "Upload do cloudu úspěšný"
         return 0
     else
-        log_message "ERROR: Failed to upload log to cloud"
+        log_message ERROR "Upload do cloudu selhal"
         return 1
     fi
 }
 
-# Robustní ping test s více cíli
-ping_test() {
-    local successful_pings=0
-    local total_latency=0
-    local tested_targets=""
-    local error_details=""
+should_upload() {
+    local current_time
+    current_time=$(date +%s)
+    local time_since_upload=$((current_time - LAST_UPLOAD_TIME))
     
-    for target in "${PING_TARGETS[@]}"; do
-        tested_targets="${tested_targets}${target};"
-        
-        local output
-        output=$(ping -c "$PING_COUNT" -W "$PING_TIMEOUT" "$target" 2>&1)
-        local exit_code=$?
-        
-        if [[ $exit_code -eq 0 ]]; then
-            # Extrakce latence - robustnější parsing
-            local latency=$(echo "$output" | grep -oE "time=[0-9]+(\.[0-9]+)?" | tail -1 | cut -d'=' -f2 | cut -d'.' -f1)
-            if [[ -n "$latency" && "$latency" =~ ^[0-9]+$ ]]; then
-                total_latency=$((total_latency + latency))
-                successful_pings=$((successful_pings + 1))
-            fi
-        else
-            # Zachycení chybových zpráv
-            if echo "$output" | grep -q "Name or service not known"; then
-                error_details="${error_details}DNS_FAIL;"
-            elif echo "$output" | grep -q "Network is unreachable"; then
-                error_details="${error_details}NET_UNREACHABLE;"
-            elif echo "$output" | grep -q "Destination Host Unreachable"; then
-                error_details="${error_details}HOST_UNREACHABLE;"
-            else
-                error_details="${error_details}TIMEOUT;"
-            fi
-        fi
-    done
-    
-    if [[ $successful_pings -ge $PING_SUCCESS_THRESHOLD ]]; then
-        local avg_latency=$((total_latency / successful_pings))
-        echo "UP:$avg_latency:$tested_targets:$successful_pings/${#PING_TARGETS[@]}"
-    else
-        echo "DOWN:0:$tested_targets:$error_details"
-    fi
+    [[ $time_since_upload -ge $UPLOAD_INTERVAL ]]
 }
 
-# Kontrola velikosti logu a rotace
+# ===== LOG ROTACE =====
+
 check_log_rotation() {
-    if [[ -f "$LOG_FILE" ]]; then
-        local log_size=$(stat -f%z "$LOG_FILE" 2>/dev/null || stat -c%s "$LOG_FILE" 2>/dev/null || echo 0)
+    [[ ! -f "$LOG_FILE" ]] && return
+    
+    local log_size
+    log_size=$(stat -f%z "$LOG_FILE" 2>/dev/null || stat -c%s "$LOG_FILE" 2>/dev/null || echo 0)
+    
+    if [[ $log_size -gt $MAX_LOG_SIZE ]]; then
+        local backup_file="${LOG_FILE%.csv}-$(date '+%Y%m%d_%H%M%S').csv"
         
-        if [[ $log_size -gt $MAX_LOG_SIZE ]]; then
-            local backup_file="${LOG_FILE%.csv}-$(date '+%Y%m%d_%H%M%S').csv"
-            mv "$LOG_FILE" "$backup_file"
-            echo "timestamp,status,latency_ms,outage_duration,target_tested,error_details,script_version" > "$LOG_FILE"
-            log_message "Log rotated: $backup_file (size: ${log_size} bytes)"
-            
-            # Upload rotovaného souboru
-            if [[ "$UPLOAD_ON_CHANGE" == "true" ]]; then
-                rclone copy "$backup_file" "$RCLONE_REMOTE:$RCLONE_PATH" --quiet &
-            fi
-        fi
+        mv "$LOG_FILE" "$backup_file"
+        echo "timestamp,status,latency_ms,outage_duration,failed_targets,error_details" > "$LOG_FILE"
+        
+        log_message INFO "Log rotován: $backup_file (velikost: $((log_size/1024))KB)"
+        
+        # Async upload rotovaného souboru
+        (rclone copy "$backup_file" "$RCLONE_REMOTE:$RCLONE_PATH" --quiet &) 2>/dev/null
     fi
 }
 
-# Zdravotní kontrola skriptu
-health_check() {
-    local current_time=$(date +%s)
-    local last_check_file="/tmp/inet_monitor_health"
-    
-    if [[ -f "$last_check_file" ]]; then
-        local last_check=$(cat "$last_check_file")
-        if [[ $((current_time - last_check)) -lt $HEALTH_CHECK_INTERVAL ]]; then
-            return
-        fi
-    fi
-    
-    echo "$current_time" > "$last_check_file"
-    
-    # Kontrola dostupnosti cílových serverů
-    local reachable_targets=0
-    for target in "${PING_TARGETS[@]}"; do
-        if ping -c 1 -W 1 "$target" >/dev/null 2>&1; then
-            reachable_targets=$((reachable_targets + 1))
-        fi
-    done
-    
-    if [[ $reachable_targets -eq 0 ]]; then
-        log_message "WARNING: No ping targets are reachable - possible network issue"
-    fi
-    
-    # Kontrola místa na disku
-    local available_space=$(df "$(dirname "$LOG_FILE")" | tail -1 | awk '{print $4}')
-    if [[ $available_space -lt 100000 ]]; then  # Méně než 100MB
-        log_message "WARNING: Low disk space available: ${available_space}KB"
-    fi
-}
+# ===== CLEANUP =====
 
-# Funkce pro cleanup při ukončení
-cleanup() {
-    log_message "Monitoring stopped by user (graceful shutdown)"
-    rm -f "$LOCK_FILE"
+cleanup_and_exit() {
+    log_message INFO "Ukončuji monitoring..."
+    release_lock
+    
+    # Ukončení background procesů
+    jobs -p | xargs -r kill 2>/dev/null || true
+    
     exit 0
 }
 
-# ===== HLAVNÍ SMYČKA =====
+# ===== HLAVNÍ MONITORING LOOP =====
 
-log_message "Starting enhanced internet connection monitoring v2.0"
-log_message "Targets: ${PING_TARGETS[*]}, Interval: ${PING_INTERVAL}s, Ping: -c $PING_COUNT -W $PING_TIMEOUT"
-log_message "Success threshold: $PING_SUCCESS_THRESHOLD/${#PING_TARGETS[@]} targets"
-log_message "Log file: $LOG_FILE (max size: $((MAX_LOG_SIZE/1024/1024))MB)"
-log_message "Cloud: $RCLONE_REMOTE:$RCLONE_PATH (upload on change: $UPLOAD_ON_CHANGE)"
-log_message "Email notifications: $SEND_EMAIL"
-
-# Nastavení trap pro graceful shutdown
-trap cleanup SIGINT SIGTERM
-
-# Čítače pro různé intervaly
-upload_counter=0
-health_counter=0
-
-while true; do
-    # Zdravotní kontrola
-    health_counter=$((health_counter + PING_INTERVAL))
-    if [[ $health_counter -ge $HEALTH_CHECK_INTERVAL ]]; then
-        health_check
-        health_counter=0
-    fi
+main_loop() {
+    log_message INFO "Spouštím monitoring loop"
+    log_message INFO "Cíle: ${PING_TARGETS[*]}"
+    log_message INFO "Interval: ${PING_INTERVAL}s, Ping: -c $PING_COUNT -W $PING_TIMEOUT"
+    log_message INFO "Úspěch: $SUCCESS_THRESHOLD/${#PING_TARGETS[@]} cílů"
     
-    # Kontrola rotace logu
-    check_log_rotation
-    
-    # Provedení ping testu
-    result=$(ping_test)
-    IFS=':' read -r current_status latency tested_targets extra_info <<< "$result"
-    current_time=$(date '+%Y-%m-%d %H:%M:%S')
-    
-    # Čtení aktuálního stavu
-    if [[ -f "$TEMP_STATE" ]]; then
-        previous_status=$(head -n1 "$TEMP_STATE")
-        previous_time=$(sed -n '2p' "$TEMP_STATE")
-    else
-        previous_status="UNKNOWN"
-        previous_time="$current_time"
-    fi
-    
-    # Detekce změny stavu
-    if [[ "$current_status" != "$previous_status" ]]; then
-        log_message "Status change: $previous_status -> $current_status"
+    while [[ "$SHUTDOWN_REQUESTED" == "false" ]]; do
+        # Kontrola rotace logu
+        check_log_rotation
         
-        if [[ "$current_status" == "DOWN" ]]; then
-            # Přechod do DOWN stavu
-            echo "$current_time,DOWN,N/A,N/A,$tested_targets,$extra_info,v2.0" >> "$LOG_FILE"
-            log_message "Connection DOWN - all targets failed: $extra_info"
+        # Provedení ping testů
+        local current_time
+        current_time=$(date '+%Y-%m-%d %H:%M:%S')
+        
+        local test_result
+        test_result=$(ping_test_all_targets)
+        
+        # Parsování výsledku
+        IFS=':' read -r current_status latency failed_targets error_details <<< "$test_result"
+        
+        # Čtení předchozího stavu
+        local previous_state
+        previous_state=$(read_previous_state)
+        IFS=':' read -r previous_status previous_time <<< "$previous_state"
+        
+        # Detekce změny stavu
+        if [[ "$current_status" != "$previous_status" ]]; then
+            log_message INFO "Změna stavu: $previous_status -> $current_status"
             
-            # E-mail notifikace o výpadku
-            send_email_notification "Connection DOWN" \
-                "Internet connection lost at $current_time\nTested targets: $tested_targets\nError details: $extra_info"
+            case "$current_status" in
+                "DOWN")
+                    log_to_csv "$current_time" "DOWN" "N/A" "N/A" "$failed_targets" "$error_details"
+                    log_message WARN "Připojení DOWN - selhaly cíle: $failed_targets"
+                    ;;
+                "UP")
+                    if [[ "$previous_status" == "DOWN" ]]; then
+                        local outage_duration
+                        outage_duration=$(calculate_outage_duration "$previous_time" "$current_time")
+                        
+                        log_to_csv "$current_time" "UP" "$latency" "$outage_duration" "" ""
+                        log_message INFO "Připojení obnoveno (${latency}ms) - výpadek: $outage_duration"
+                    fi
+                    ;;
+            esac
             
-        elif [[ "$current_status" == "UP" && "$previous_status" == "DOWN" ]]; then
-            # Návrat do UP stavu - výpočet délky výpadku
-            outage_duration=$(calculate_outage_duration "$previous_time" "$current_time")
+            # Aktualizace stavu
+            update_state "$current_status" "$current_time"
             
-            echo "$current_time,UP,$latency,$outage_duration,$tested_targets,$extra_info,v2.0" >> "$LOG_FILE"
-            log_message "Connection restored (${latency}ms avg) - outage duration: $outage_duration ($extra_info)"
-            
-            # E-mail notifikace o obnovení
-            send_email_notification "Connection restored" \
-                "Internet connection restored at $current_time\nAverage latency: ${latency}ms\nOutage duration: $outage_duration\nSuccessful targets: $extra_info"
+            # Okamžitý upload při změně stavu
+            upload_to_cloud &
         fi
         
-        # Aktualizace stavového souboru
-        {
-            echo "$current_status"
-            echo "$current_time"
-            echo "Status changed from $previous_status"
-        } > "$TEMP_STATE"
+        # Pravidelný upload
+        if should_upload; then
+            upload_to_cloud &
+        fi
         
-        # Upload do cloudu při změně stavu
-        if [[ "$UPLOAD_ON_CHANGE" == "true" ]]; then
-            upload_to_cloud &  # Asynchronní upload
-        fi
-    fi
+        # Čekání do dalšího cyklu
+        sleep "$PING_INTERVAL"
+    done
+}
+
+# ===== MAIN =====
+
+main() {
+    # Kontrola argumentů
+    while [[ $# -gt 0 ]]; do
+        case $1 in
+            -v|--verbose)
+                VERBOSE=true
+                ;;
+            -h|--help)
+                echo "Použití: $0 [-v|--verbose] [-h|--help]"
+                echo "  -v, --verbose    Podrobný výstup"
+                echo "  -h, --help       Tato nápověda"
+                exit 0
+                ;;
+            *)
+                echo "Neznámý parametr: $1" >&2
+                exit 1
+                ;;
+        esac
+        shift
+    done
     
-    # Pravidelný upload do cloudu
-    if [[ "$UPLOAD_INTERVAL" -gt 0 ]]; then
-        upload_counter=$((upload_counter + PING_INTERVAL))
-        if [[ $upload_counter -ge $UPLOAD_INTERVAL ]]; then
-            upload_to_cloud &  # Asynchronní upload
-            upload_counter=0
-        fi
-    fi
+    # Inicializace
+    acquire_lock
+    initialize
     
-    # Čekání do dalšího cyklu
-    sleep "$PING_INTERVAL"
-done
+    # Spuštění hlavní smyčky
+    main_loop
+    
+    # Cleanup
+    cleanup_and_exit
+}
+
+# Spuštění pouze pokud je skript spuštěn přímo
+if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
+    main "$@"
+fi
