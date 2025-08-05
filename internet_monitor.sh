@@ -1,137 +1,238 @@
 #!/bin/bash
+#########################################################################
+# Internet Hop Monitor for Void Linux
+#
+# Diagnostika výpadků a vysoké latence na klíčových síťových bodech (hopy)
+# Určeno pro troubleshooting a argumentaci vůči poskytovateli internetu.
+#
+# Sleduje 4 konkrétní hopy:
+#   192.168.1.1       # ROUTER      - Tvůj domácí router
+#   10.4.40.1         # CPE/ANTENA  - První zařízení ISP (switch, anténa, bridge)
+#   100.100.4.254     # CGNAT       - Carrier-Grade NAT router ISP
+#   172.31.255.2      # ISP_CORE    - Páteřní bod poskytovatele
+#
+# Typy záznamů:
+#   DOWN         - Výpadek konektivity (ani jeden ping neprojde)
+#   UP           - Obnovení spojení, vypočítána délka výpadku
+#   HIGH_LATENCY - Vysoká odezva (průměrný ping > LATENCY_THRESHOLD ms)
+#
+# Výstup CSV:
+# timestamp;hop_ip;hop_name;status;latency_ms;down_since;up_since;duration_sec;error_details
+#
+# Logy se každou hodinu synchronizují na ProtonDrive (rclone).
+#
+# Autor: 0xF1X
+#########################################################################
 
-#################################################################
-# Internet Connection Hop Monitor - FIXED
-# Sleduje hopy k ISP a loguje výpadky s ochranou proti pádu
-# Opraveno: dělení nulou, správa locku, správné trapování, robustní chování
-#################################################################
+# ==== KONFIGURACE ====
+declare -A HOPS=(
+    ["192.168.1.1"]="ROUTER"
+    ["10.4.40.1"]="CPE/ANTENA"
+    ["100.100.4.254"]="CGNAT"
+    ["172.31.255.2"]="ISP_CORE"
+)
 
-# --- KONFIGURACE ---
-readonly PING_TARGETS=("192.168.1.1" "10.4.40.1" "100.100.4.254" "172.31.255.2")
-readonly PING_INTERVAL=30
-readonly PING_COUNT=2
-readonly PING_TIMEOUT=2
+PING_INTERVAL=30
+PING_COUNT=3
+PING_TIMEOUT=2
+LATENCY_THRESHOLD=100         # ms
 
-readonly LOG_FILE="/home/w3men0/poruchy.csv"
-readonly STATE_FILE="/home/w3men0/.inet_monitor_state"
-readonly LOCK_FILE="/tmp/inet_monitor.lock"
-readonly VERBOSE=true
+LOG_FILE="/home/w3men0/poruchy.csv"
+LOG_TEXT_FILE="/home/w3men0/inet_monitor.log"
+STATE_FILE="/home/w3men0/.inet_monitor_state"
+LOCK_FILE="/tmp/inet_monitor.lock"
 
-# --- GLOBÁLNÍ PROMĚNNÉ ---
+RCLONE_REMOTE="protondrive"
+RCLONE_PATH="monitoring/"
+UPLOAD_INTERVAL=3600
+
+MAX_LOG_SIZE=10485760
+
+set -u
 declare -g SHUTDOWN_REQUESTED=0
 
-# --- FUNKCE ---
-log_message() {
-    local level="$1"
-    local message="$2"
-    if [[ "$level" == "DEBUG" && "$VERBOSE" != "true" ]]; then
-        return
-    fi
-    echo "[$(date '+%Y-%m-%d %H:%M:%S')] $level: $message" >&2
+log_msg() {
+    local msg="[$(date '+%Y-%m-%d %H:%M:%S')] $1"
+    echo "$msg"
+    echo "$msg" >> "$LOG_TEXT_FILE"
 }
 
 cleanup() {
-    log_message INFO "Ukončuji skript a uvolňuji zámek..."
-    if [[ -f "$LOCK_FILE" ]] && [[ "$(cat "$LOCK_FILE" 2>/dev/null)" == "$$" ]]; then
-        rm -f "$LOCK_FILE"
-    fi
+    log_msg "Skript ukončen."
+    rm -f "$LOCK_FILE"
+    exit 0
 }
-
-acquire_lock() {
-    if [[ -f "$LOCK_FILE" ]]; then
-        local pid
-        pid=$(cat "$LOCK_FILE" 2>/dev/null)
-        if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null; then
-            log_message ERROR "Již běží jiná instance (PID: $pid). Ukončuji."
-            exit 1
-        else
-            rm -f "$LOCK_FILE"
-        fi
-    fi
-    echo "$$" > "$LOCK_FILE"
-}
-
-# --- TRAPY ---
 trap 'SHUTDOWN_REQUESTED=1' SIGINT SIGTERM
 trap cleanup EXIT
 
-# --- START ---
-acquire_lock
-log_message INFO "Internet Hop Monitor spuštěn (PID: $$)."
+if [[ -f "$LOCK_FILE" ]]; then
+    if kill -0 "$(cat "$LOCK_FILE")" 2>/dev/null; then
+        log_msg "Jiná instance běží (PID: $(cat "$LOCK_FILE"))"
+        exit 1
+    else
+        rm -f "$LOCK_FILE"
+    fi
+fi
+echo $$ > "$LOCK_FILE"
 
 mkdir -p "$(dirname "$LOG_FILE")"
+
 if [[ ! -f "$LOG_FILE" ]]; then
-    echo "timestamp,status,avg_latency_ms,outage_duration_hms,failed_hops" > "$LOG_FILE"
+    cat <<EOF > "$LOG_FILE"
+# LEGEND: timestamp;hop_ip;hop_name;status;latency_ms;down_since;up_since;duration_sec;error_details
+# HOPS: 192.168.1.1=ROUTER, 10.4.40.1=CPE/ANTENA, 100.100.4.254=CGNAT, 172.31.255.2=ISP_CORE
+timestamp;hop_ip;hop_name;status;latency_ms;down_since;up_since;duration_sec;error_details
+EOF
 fi
 
-# Načtení posledního stavu
-last_status="UP"
-last_status_time=$(date +%s)
+# --- BEZPEČNÁ INICIALIZACE POLE S PŘEDVÝCHOZÍMI HODNOTAMI ---
+declare -A LAST_STATUS LAST_DOWN_SINCE
+
+for ip in "${!HOPS[@]}"; do
+    LAST_STATUS["$ip"]="UP"
+    LAST_DOWN_SINCE["$ip"]=""
+done
+
+# Pokud existuje STATE_FILE, přepiš hodnoty podle souboru (pouze sledované IP)
 if [[ -f "$STATE_FILE" ]]; then
-    read -r last_status last_status_time < "$STATE_FILE" || true
+    while IFS=',' read -r ip status down_since; do
+        [[ -n "$ip" && -n "${HOPS[$ip]+x}" ]] && LAST_STATUS["$ip"]=$status && LAST_DOWN_SINCE["$ip"]=$down_since
+    done < "$STATE_FILE"
 fi
+
+save_state() {
+    > "$STATE_FILE"
+    for ip in "${!HOPS[@]}"; do
+        echo "$ip,${LAST_STATUS[$ip]},${LAST_DOWN_SINCE[$ip]}" >> "$STATE_FILE"
+    done
+}
+
+calculate_duration() {
+    local start="$1" end="$2"
+    local t1=$(date -d "$start" +%s 2>/dev/null)
+    local t2=$(date -d "$end" +%s 2>/dev/null)
+    [[ -z "$t1" || -z "$t2" || $t1 -gt $t2 ]] && echo "N/A" && return
+    echo $((t2 - t1))
+}
+
+upload_to_cloud() {
+    if ! command -v rclone >/dev/null 2>&1; then
+        log_msg "rclone není nainstalován, upload přeskočen."
+        return
+    fi
+    if ! rclone listremotes | grep -q "^${RCLONE_REMOTE}:$"; then
+        log_msg "rclone remote '$RCLONE_REMOTE' není nakonfigurován."
+        return
+    fi
+    rclone copy "$LOG_FILE" "$RCLONE_REMOTE:$RCLONE_PATH" --quiet
+    log_msg "poruchy.csv synchronizován na ProtonDrive."
+}
+
+check_log_rotation() {
+    if [[ -f "$LOG_FILE" ]]; then
+        local log_size=$(stat -c%s "$LOG_FILE" 2>/dev/null || echo 0)
+        if [[ $log_size -gt $MAX_LOG_SIZE ]]; then
+            local backup="${LOG_FILE%.csv}-$(date '+%Y%m%d_%H%M%S').csv"
+            mv "$LOG_FILE" "$backup"
+            cat <<EOF > "$LOG_FILE"
+# LEGEND: timestamp;hop_ip;hop_name;status;latency_ms;down_since;up_since;duration_sec;error_details
+# HOPS: 192.168.1.1=ROUTER, 10.4.40.1=CPE/ANTENA, 100.100.4.254=CGNAT, 172.31.255.2=ISP_CORE
+timestamp;hop_ip;hop_name;status;latency_ms;down_since;up_since;duration_sec;error_details
+EOF
+            log_msg "Log rotován: $backup"
+        fi
+    fi
+}
+
+# Test jednoho hopu, výstup: status:latency:err
+test_hop() {
+    local ip="$1"
+    local name="$2"
+    local output latency status err
+    output=$(ping -c "$PING_COUNT" -W "$PING_TIMEOUT" "$ip" 2>&1)
+    if [[ $? -eq 0 ]]; then
+        # RTT průměr (ms)
+        latency=$(echo "$output" | awk -F'/' '/rtt|round-trip/ {print int($5)}')
+        [[ -z "$latency" || ! "$latency" =~ ^[0-9]+$ ]] && latency=0
+        if (( latency > LATENCY_THRESHOLD )); then
+            status="HIGH_LATENCY"
+            err="RTT=${latency}ms"
+        else
+            status="UP"
+            err=""
+        fi
+    else
+        status="DOWN"
+        latency="N/A"
+        if echo "$output" | grep -q "Name or service not known"; then
+            err="DNS_FAIL"
+        elif echo "$output" | grep -q "Network is unreachable"; then
+            err="NET_UNREACHABLE"
+        elif echo "$output" | grep -q "Destination Host Unreachable"; then
+            err="HOST_UNREACHABLE"
+        else
+            err="TIMEOUT"
+        fi
+    fi
+    echo "$status:$latency:$err"
+}
+
+log_event() {
+    local timestamp="$1" ip="$2" name="$3" status="$4" latency="$5" down_since="$6" up_since="$7" duration="$8" err="$9"
+    echo "$timestamp;$ip;$name;$status;$latency;$down_since;$up_since;$duration;$err" >> "$LOG_FILE"
+}
+
+log_msg "Internet Hop Monitor spuštěn."
+
+last_upload_time=$(date +%s)
 
 while [[ "$SHUTDOWN_REQUESTED" -eq 0 ]]; do
-    success_count=0
-    total_latency=0
-    failed_hops=""
-    current_status="UP"
+    check_log_rotation
 
-    for i in "${!PING_TARGETS[@]}"; do
-        target="${PING_TARGETS[i]}"
-        hop_num=$((i + 1))
-        output=$(ping -c $PING_COUNT -W $PING_TIMEOUT "$target" 2>&1)
-        exit_code=$?
+    now=$(date '+%Y-%m-%d %H:%M:%S')
 
-        if [[ $exit_code -eq 0 ]]; then
-            ((success_count++))
-            # Robustní extrakce latence:
-            latency=$(echo "$output" | awk -F'/' '/rtt/ {print int($5)}')
-            if [[ -z "$latency" ]]; then
-                latency=0
-            fi
-            ((total_latency += latency))
-        else
-            current_status="DOWN"
-            failed_hops+="${target} (hop${hop_num});"
+    for ip in "${!HOPS[@]}"; do
+        name="${HOPS[$ip]}"
+        IFS=':' read -r status latency err < <(test_hop "$ip" "$name")
+        prev_status="${LAST_STATUS[$ip]}"
+        prev_down_since="${LAST_DOWN_SINCE[$ip]}"
+
+        # DOWN event
+        if [[ "$status" == "DOWN" && "$prev_status" != "DOWN" ]]; then
+            log_event "$now" "$ip" "$name" "DOWN" "N/A" "$now" "" "" "$err"
+            LAST_STATUS["$ip"]="DOWN"
+            LAST_DOWN_SINCE["$ip"]="$now"
+            log_msg "[$name/$ip] Výpadek: $err"
+        # UP event (obnova)
+        elif [[ "$status" == "UP" && "$prev_status" == "DOWN" ]]; then
+            duration=$(calculate_duration "$prev_down_since" "$now")
+            log_event "$now" "$ip" "$name" "UP" "$latency" "$prev_down_since" "$now" "$duration" "$err"
+            LAST_STATUS["$ip"]="UP"
+            LAST_DOWN_SINCE["$ip"]=""
+            log_msg "[$name/$ip] Obnoveno po $duration s"
+        # HIGH_LATENCY (pouze pokud nebylo již v předchozím cyklu high latency)
+        elif [[ "$status" == "HIGH_LATENCY" && "$prev_status" != "HIGH_LATENCY" ]]; then
+            log_event "$now" "$ip" "$name" "HIGH_LATENCY" "$latency" "" "" "" "$err"
+            LAST_STATUS["$ip"]="HIGH_LATENCY"
+            log_msg "[$name/$ip] Vysoká latence: $latency ms"
+        # Pokud je vše OK (UP a předtím bylo HIGH_LATENCY), poznamenat obnovení normálu
+        elif [[ "$status" == "UP" && "$prev_status" == "HIGH_LATENCY" ]]; then
+            log_event "$now" "$ip" "$name" "UP" "$latency" "" "" "" ""
+            LAST_STATUS["$ip"]="UP"
+            log_msg "[$name/$ip] Latence OK: $latency ms"
         fi
     done
 
-    # Ošetření dělení nulou
-    if [[ $success_count -gt 0 ]]; then
-        avg_latency=$((total_latency / success_count))
-    else
-        avg_latency=0
+    save_state
+
+    now_epoch=$(date +%s)
+    if (( now_epoch - last_upload_time >= UPLOAD_INTERVAL )); then
+        upload_to_cloud
+        last_upload_time=$now_epoch
     fi
 
-    # Změna stavu?
-    if [[ "$current_status" != "$last_status" ]]; then
-        log_message INFO "Změna stavu: ${last_status} -> ${current_status}"
-        current_time_s=$(date +%s)
-        if [[ "$current_status" == "UP" ]]; then
-            duration=$((current_time_s - last_status_time))
-            duration_hms=$(date -u -d "@$duration" '+%H:%M:%S')
-            echo "$(date '+%Y-%m-%d %H:%M:%S'),UP,${avg_latency},${duration_hms}," >> "$LOG_FILE"
-            log_message INFO "PŘIPOJENÍ OBNOVENO. Výpadek trval ${duration_hms}."
-        else
-            echo "$(date '+%Y-%m-%d %H:%M:%S'),DOWN,N/A,N/A,${failed_hops}" >> "$LOG_FILE"
-            log_message WARN "VÝPADEK ZJIŠTĚN. Nedostupné hopy: ${failed_hops}"
-        fi
-        last_status="$current_status"
-        last_status_time="$current_time_s"
-        echo "$last_status $last_status_time" > "$STATE_FILE"
-    fi
-
-    log_message DEBUG "Cyklus dokončen. Stav: ${current_status}. Dosažitelné hopy: ${success_count}/${#PING_TARGETS[@]}."
-
-    # Čekání s možností přerušení
     for ((i=0; i<PING_INTERVAL; i++)); do
-        if [[ "$SHUTDOWN_REQUESTED" -eq 1 ]]; then
-            log_message INFO "Detekován požadavek na ukončení, opouštím smyčku."
-            break 2
-        fi
+        [[ "$SHUTDOWN_REQUESTED" -eq 1 ]] && break
         sleep 1
     done
 done
-
-exit 0
